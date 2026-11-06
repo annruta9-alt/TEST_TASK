@@ -86,6 +86,22 @@ OVERLAY_JS = r"""
     a.onfinish = () => r.remove();
   }, true);
 
+  // Smooth glide driven by requestAnimationFrame (frame-locked, no IPC jitter).
+  window.__pwGlide = (tx, ty, ms) => new Promise((resolve) => {
+    const x0 = x, y0 = y, t0 = performance.now();
+    const step = (now) => {
+      const t = Math.min(1, (now - t0) / ms);
+      const e = t * t * t * (t * (6 * t - 15) + 10);  // smootherstep
+      x = x0 + (tx - x0) * e; y = y0 + (ty - y0) * e; place();
+      if (t < 1) { requestAnimationFrame(step); }
+      else {
+        try { sessionStorage.setItem('__pw_cur', JSON.stringify({ x, y })); } catch (e) {}
+        resolve(true);
+      }
+    };
+    requestAnimationFrame(step);
+  });
+
   window.__pwCallout = (text, bg, fg, fadeMs, pos) => {
     const old = document.getElementById('__pw_callout');
     if (old) old.remove();
@@ -132,27 +148,31 @@ def ShowCallout(text, bgColor="#ffeb3b", textColor="#000000", fade=2.0,
 
 
 def _move_mouse(page, x, y, duration=None):
-    """Glide the pointer along a slightly curved path with ease-in-out timing."""
+    """Glide the pointer in a straight line with smooth ease-in-out.
+
+    The animation runs inside the page on requestAnimationFrame, so it is locked
+    to the browser's frames and the recorded video is smooth. The real mouse is
+    then placed on the target (hover/click work as usual). No randomness.
+    """
     x0, y0 = _mouse
     dist = math.hypot(x - x0, y - y0)
+    if dist < 1:
+        return
     if duration is None:
-        duration = min(1.6, max(0.5, dist / 700))
-    steps = max(20, int(duration * 60))
-    # control point for a gentle curve
-    nx, ny = (-(y - y0), x - x0)
-    norm = math.hypot(nx, ny) or 1.0
-    off = random.uniform(-0.12, 0.12) * dist
-    cx, cy = (x0 + x) / 2 + nx / norm * off, (y0 + y) / 2 + ny / norm * off
-    t_start = time.time()
-    for i in range(1, steps + 1):
-        t = i / steps
-        e = t * t * (3 - 2 * t)  # smoothstep
-        px = (1 - e) ** 2 * x0 + 2 * (1 - e) * e * cx + e * e * x
-        py = (1 - e) ** 2 * y0 + 2 * (1 - e) * e * cy + e * e * y
-        page.mouse.move(px, py)
-        wait = t_start + duration * t - time.time()
-        if wait > 0:
-            time.sleep(wait)
+        duration = min(1.6, max(0.6, dist / 600))
+    try:
+        page.evaluate("([x, y, ms]) => window.__pwGlide(x, y, ms)",
+                      [x, y, int(duration * 1000)])
+    except Exception:
+        # fallback: time-based glide with real mouse events
+        t_start = time.perf_counter()
+        while True:
+            t = (time.perf_counter() - t_start) / duration
+            if t >= 1:
+                break
+            e = t * t * t * (t * (6 * t - 15) + 10)
+            page.mouse.move(x0 + (x - x0) * e, y0 + (y - y0) * e)
+            time.sleep(0.004)
     page.mouse.move(x, y)
     _mouse[0], _mouse[1] = x, y
 
@@ -187,8 +207,7 @@ def _find_visible(page, selector, timeout_ms):
 
 def _target_point(page, selector, timeout_ms):
     box = _find_visible(page, selector, timeout_ms)
-    return (box["x"] + box["width"] * random.uniform(0.35, 0.65),
-            box["y"] + box["height"] * random.uniform(0.4, 0.6))
+    return (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
 
 
 def _move_and_click(page, selector, timeout_ms=30000):
