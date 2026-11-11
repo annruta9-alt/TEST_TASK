@@ -1,0 +1,41 @@
+services:
+  web:
+    build: .                      # Apache + mod_wsgi + Flask (see Dockerfile)
+    ports:
+      - "8000:80"                 # host 8000 -> Apache 80 inside the container
+    volumes:
+      - uploads:/app/uploads
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: videos
+      DB_USER: video_user
+      DB_PASSWORD: ${DB_PASSWORD:-video_pass}   # override in .env (not committed)
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: videos
+      POSTGRES_USER: video_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-video_pass}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U video_user -d videos"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  db_data:
+  uploads:
