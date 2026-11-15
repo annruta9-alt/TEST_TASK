@@ -1,0 +1,14 @@
+.env
+.git
+uploads
+video
+tests
+__pycache__
+*.pyc
+*.md
+qscript.py
+capture_video.py
+video_client.py
+input.csv
+requirements-*.txt
+docker-compose.yml

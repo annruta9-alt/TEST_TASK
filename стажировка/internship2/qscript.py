@@ -1,0 +1,534 @@
+"""Browser automation scenario with visual effects (SVG cursor, ripple, callout)
+and Camtasia-style zoom events (F5 / window.__zoomAt) written to a sidecar file."""
+import json
+import math
+import os
+import random
+import re
+import shutil
+import time
+
+from playwright.sync_api import sync_playwright
+
+PATH_TO_VIDEO_FOLDER = "./video"
+
+# DuckDuckGo blocks classic headless Chromium (HTTP 418 page), so by default the
+# browser window is visible. Set QS_HEADLESS=1 to try new headless mode instead.
+HEADLESS = os.environ.get("QS_HEADLESS") == "1"
+MAX_ATTEMPTS = 3
+
+VIEWPORT = {"width": 1280, "height": 720}
+
+# ---- zoom (post-processed by apply_zoom.py) ----------------------------------------
+VIDEO_FPS = 25            # Playwright records video at 25 fps
+ZOOM_FACTOR = 2.0
+ZOOM_RAMP_SEC = 0.5       # length of the zoom-in and of the zoom-out
+ZOOM_INDICATOR = True     # brief coloured ring: green = zoom in, red = zoom out
+ZOOM_DEMO = True          # the sample scenario triggers zoom itself (window.__zoomAt)
+
+SEL_SEARCH_BOX = 'textarea[name="q"]'
+SEL_SEARCH_BTN = 'form button[type="submit"]'
+SEL_FIRST_RESULT = 'a[data-testid="result-title-a"]'
+
+# Injected into every page (IIFE: add_init_script evaluates the string as-is).
+OVERLAY_JS = r"""
+(() => {
+  if (window.__pwOverlay) return;
+  window.__pwOverlay = true;
+  const SIZE = 32, HALO = 64;
+  let x = 20, y = 20;
+  try {
+    const s = JSON.parse(sessionStorage.getItem('__pw_cur') || 'null');
+    if (s) { x = s.x; y = s.y; }
+  } catch (e) {}
+
+  const root = document.createElement('div');
+  root.id = '__pw_overlay';
+  root.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;' +
+    'z-index:2147483647;pointer-events:none;';
+
+  const halo = document.createElement('div');
+  halo.style.cssText = `position:fixed;left:0;top:0;width:${HALO}px;height:${HALO}px;` +
+    'border-radius:50%;background:rgba(255,220,0,0.35);pointer-events:none;' +
+    'will-change:transform;';
+
+  const cursor = document.createElement('div');
+  cursor.style.cssText = `position:fixed;left:0;top:0;width:${SIZE}px;height:${SIZE}px;` +
+    'pointer-events:none;will-change:transform;';
+  cursor.innerHTML =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${SIZE}" height="${SIZE}" viewBox="0 0 32 32">` +
+    '<path d="M3 2 L3 26 L9.5 20 L14.5 30 L19 28 L14 18 L23 18 Z" ' +
+    'fill="#fff" stroke="#000" stroke-width="2" stroke-linejoin="round"/></svg>';
+
+  root.appendChild(halo);
+  root.appendChild(cursor);
+
+  function place() {
+    halo.style.transform = `translate(${x - HALO / 2}px, ${y - HALO / 2}px)`;
+    cursor.style.transform = `translate(${x}px, ${y}px)`;  // arrow tip == pointer
+  }
+
+  function mount() {
+    const host = document.documentElement;
+    if (host && !root.isConnected) host.appendChild(root);
+  }
+  mount();
+  document.addEventListener('DOMContentLoaded', mount);
+  new MutationObserver(mount).observe(document, { childList: true, subtree: false });
+  place();
+
+  window.addEventListener('mousemove', (e) => {
+    x = e.clientX; y = e.clientY; place();
+    try { sessionStorage.setItem('__pw_cur', JSON.stringify({ x, y })); } catch (e) {}
+  }, true);
+
+  window.addEventListener('mousedown', (e) => {
+    const r = document.createElement('div');
+    r.style.cssText = `position:fixed;left:${e.clientX - HALO / 2}px;top:${e.clientY - HALO / 2}px;` +
+      `width:${HALO}px;height:${HALO}px;border-radius:50%;box-sizing:border-box;` +
+      'border:3px solid rgba(255,140,0,0.9);background:rgba(255,140,0,0.15);' +
+      'pointer-events:none;';
+    root.appendChild(r);
+    const a = r.animate(
+      [{ transform: 'scale(0.1)', opacity: 1 }, { transform: 'scale(1)', opacity: 0 }],
+      { duration: 600, easing: 'ease-out' });
+    a.onfinish = () => r.remove();
+  }, true);
+
+  // Smooth glide driven by requestAnimationFrame (frame-locked, no IPC jitter).
+  window.__pwGlide = (tx, ty, ms) => new Promise((resolve) => {
+    const x0 = x, y0 = y, t0 = performance.now();
+    const step = (now) => {
+      const t = Math.min(1, (now - t0) / ms);
+      const e = t * t * t * (t * (6 * t - 15) + 10);  // smootherstep
+      x = x0 + (tx - x0) * e; y = y0 + (ty - y0) * e; place();
+      if (t < 1) { requestAnimationFrame(step); }
+      else {
+        try { sessionStorage.setItem('__pw_cur', JSON.stringify({ x, y })); } catch (e) {}
+        resolve(true);
+      }
+    };
+    requestAnimationFrame(step);
+  });
+
+  // ---- zoom toggle: F5 key or window.__zoomAt(x, y) ------------------------------
+  // The state (in/out) and the event list live in Python (qscript.py), because they
+  // must survive navigations; the page only reports "toggle at x, y" and shows a ring.
+  const ZOOM_INDICATOR = window.__zoomIndicator !== false;
+  window.__pwSetPos = (px, py) => { x = px; y = py; place(); };  // re-sync after navigation
+  function zoomRing(type, px, py) {
+    if (!ZOOM_INDICATOR) return;
+    const R = 44, col = type === 'in' ? '#00c853' : '#ff1744';
+    const r = document.createElement('div');
+    r.style.cssText = `position:fixed;left:${px - R}px;top:${py - R}px;` +
+      `width:${2 * R}px;height:${2 * R}px;border-radius:50%;box-sizing:border-box;` +
+      `border:5px solid ${col};pointer-events:none;`;
+    root.appendChild(r);
+    const from = type === 'in' ? 'scale(1.7)' : 'scale(0.5)';   // in: ring closes, out: opens
+    const to = type === 'in' ? 'scale(0.8)' : 'scale(1.3)';
+    const a = r.animate([{ transform: from, opacity: 1 }, { transform: to, opacity: 0 }],
+                        { duration: 700, easing: 'ease-out' });
+    a.onfinish = () => r.remove();
+  }
+  // Sync marker: a tiny 8x8 magenta square in the top-left corner, shown for 0.3 s at the
+  // FIRST zoom event only. apply_zoom.py finds it in the video to measure how much later
+  // the video starts than the clock used for the event times (calibration, see README).
+  function syncMarker() {
+    const m = document.createElement('div');
+    m.style.cssText = 'position:fixed;left:0;top:0;width:8px;height:8px;' +
+      'background:#ff00ff;pointer-events:none;';
+    root.appendChild(m);
+    setTimeout(() => m.remove(), 300);
+  }
+  async function zoomToggle(px, py) {
+    let res = null;
+    try { res = await window.__pwZoomEvent(Date.now(), Math.round(px), Math.round(py)); }
+    catch (e) {}
+    if (!res) return null;
+    zoomRing(res.type, px, py);
+    if (res.first) {
+      syncMarker();
+      try { await window.__pwSyncMarker(Date.now()); } catch (e) {}
+    }
+    return res.type;
+  }
+  window.__zoomAt = (px, py) =>
+    zoomToggle(px === undefined ? x : px, py === undefined ? y : py);
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'F5' && !e.repeat) {
+      e.preventDefault(); e.stopPropagation();      // F5 must not reload the page
+      zoomToggle(x, y);
+    }
+  }, true);
+
+  window.__pwCallout = (text, bg, fg, fadeMs, pos) => {
+    const old = document.getElementById('__pw_callout');
+    if (old) old.remove();
+    const c = document.createElement('div');
+    c.id = '__pw_callout';
+    c.textContent = text;
+    c.style.cssText = `position:fixed;left:${pos.x}px;top:${pos.y}px;` +
+      `background:${bg};color:${fg};font:16pt Arial,sans-serif;` +
+      'padding:6px 14px;border:1px solid rgba(0,0,0,0.4);border-radius:3px;' +
+      'white-space:nowrap;width:max-content;pointer-events:none;opacity:0;' +
+      `transition:opacity ${fadeMs}ms ease;box-shadow:0 2px 8px rgba(0,0,0,0.3);`;
+    root.appendChild(c);
+    void c.offsetWidth;
+    c.style.opacity = '1';
+  };
+  window.__pwCalloutHide = () => {
+    const c = document.getElementById('__pw_callout');
+    if (c) { c.style.opacity = '0'; setTimeout(() => c.remove(), 3000); }
+  };
+})();
+"""
+
+_page = None          # page used by the ShowCallout helper
+_mouse = [20.0, 20.0]  # last known pointer position
+_zoom = {"t0": 0.0, "state": "out", "events": [], "sync_t": None}  # current recording
+
+
+def _sleep(seconds):
+    """Wait. Uses Playwright's own wait, because in the sync API callbacks from the
+    page (F5 / __zoomAt) are only delivered while Playwright is waiting."""
+    if _page is not None:
+        try:
+            _page.wait_for_timeout(seconds * 1000)
+            return
+        except Exception:
+            pass
+    time.sleep(seconds)
+
+
+def _on_zoom_event(epoch_ms, x, y):
+    """Called from the page on every F5 / __zoomAt: toggles in <-> out and stores the
+    event. t is seconds since t0 (just before the page was created). The video itself
+    starts a little later and by an unpredictable amount, so apply_zoom.py corrects t
+    with the sync marker (see _on_sync_marker).
+    Returns {"type": "in"|"out", "first": True for the first event of the recording}."""
+    typ = "in" if _zoom["state"] == "out" else "out"
+    _zoom["state"] = typ
+    first = not _zoom["events"]
+    t = epoch_ms / 1000.0 - _zoom["t0"]
+    x = min(max(int(round(x)), 0), VIEWPORT["width"] - 1)
+    y = min(max(int(round(y)), 0), VIEWPORT["height"] - 1)
+    _zoom["events"].append({"t": round(max(t, 0.0), 3), "x": x, "y": y, "type": typ})
+    return {"type": typ, "first": first}
+
+
+def _on_sync_marker(epoch_ms):
+    """The page reports the moment the sync marker was drawn (same clock as the events)."""
+    _zoom["sync_t"] = round(epoch_ms / 1000.0 - _zoom["t0"], 3)
+
+
+def ZoomAt(x=None, y=None):
+    """Toggle the zoom around (x, y) - same as pressing F5 (default: the pointer).
+    First call = zoom-in starts, second call = zoom-out starts. Returns "in"/"out"."""
+    if _page is None:
+        return None
+    px = _mouse[0] if x is None else x
+    py = _mouse[1] if y is None else y
+    return _page.evaluate("([x, y]) => window.__zoomAt(x, y)", [px, py])
+
+
+def _write_zoom_sidecar(video_path, events, sync_t=None):
+    """<video stem>.zoom.json - only when there is at least one event."""
+    path = os.path.splitext(video_path)[0] + ".zoom.json"
+    if not events:
+        if os.path.exists(path):
+            os.remove(path)  # a stale sidecar of an older recording must not be applied
+        return None
+    data = {
+        "viewport": dict(VIEWPORT),
+        "fps": VIDEO_FPS,
+        "zoom_factor": ZOOM_FACTOR,
+        "ramp_sec": ZOOM_RAMP_SEC,
+        "events": events,
+    }
+    if sync_t is not None:  # lets apply_zoom.py align event times with the video
+        data["sync"] = {"t": sync_t, "x": 0, "y": 0, "size": 8}
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    return path
+
+
+# --------------------------------------------------------------------------- helpers
+def ShowCallout(text, bgColor="#ffeb3b", textColor="#000000", fade=2.0,
+                hold=2.0, x=None, y=None):
+    """Show a yellow callout box (16pt, auto-sized) with fade-in/out of `fade` seconds."""
+    if _page is None:
+        return
+    pos = {"x": 340 if x is None else x, "y": 70 if y is None else y}
+    try:
+        _page.evaluate(
+            "([t,b,f,ms,p]) => window.__pwCallout(t,b,f,ms,p)",
+            [text, bgColor, textColor, int(fade * 1000), pos],
+        )
+        _sleep(fade + hold)
+        _page.evaluate("() => window.__pwCalloutHide()")
+        _sleep(fade)
+    except Exception:
+        pass  # page navigated away - callout is simply gone
+
+
+def _move_mouse(page, x, y, duration=None):
+    """Glide the pointer in a straight line with smooth ease-in-out.
+
+    The animation runs inside the page on requestAnimationFrame, so it is locked
+    to the browser's frames and the recorded video is smooth. The real mouse is
+    then placed on the target (hover/click work as usual). No randomness.
+    """
+    x0, y0 = _mouse
+    dist = math.hypot(x - x0, y - y0)
+    if dist < 1:
+        return
+    if duration is None:
+        duration = min(1.6, max(0.6, dist / 600))
+    try:
+        page.evaluate("([x, y, ms]) => window.__pwGlide(x, y, ms)",
+                      [x, y, int(duration * 1000)])
+    except Exception:
+        # fallback: time-based glide with real mouse events
+        t_start = time.perf_counter()
+        while True:
+            t = (time.perf_counter() - t_start) / duration
+            if t >= 1:
+                break
+            e = t * t * t * (t * (6 * t - 15) + 10)
+            page.mouse.move(x0 + (x - x0) * e, y0 + (y - y0) * e)
+            time.sleep(0.004)
+    page.mouse.move(x, y)
+    _mouse[0], _mouse[1] = x, y
+
+
+def _find_visible(page, selector, timeout_ms):
+    """Poll until some element matching `selector` is visible; return its box.
+
+    The page may contain several matches (e.g. hidden submit buttons), so
+    `.first` is not enough - take the first one that is actually visible.
+    """
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        loc = page.locator(selector)
+        try:
+            count = loc.count()
+        except Exception:
+            count = 0
+        for i in range(count):
+            el = loc.nth(i)
+            try:
+                if not el.is_visible():
+                    continue
+                el.scroll_into_view_if_needed(timeout=2000)
+                box = el.bounding_box()
+                if box and box["width"] > 1 and box["height"] > 1:
+                    return box
+            except Exception:
+                continue
+        _sleep(0.2)
+    raise RuntimeError(f"no visible element for {selector}")
+
+
+def _target_point(page, selector, timeout_ms):
+    box = _find_visible(page, selector, timeout_ms)
+    return (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+
+def _move_and_click(page, selector, timeout_ms=30000):
+    x, y = _target_point(page, selector, timeout_ms)
+    _move_mouse(page, x, y)
+    _sleep(0.25)
+    page.mouse.click(x, y)
+
+
+def _type_human(page, text):
+    for ch in text:
+        page.keyboard.type(ch)
+        _sleep(random.uniform(0.07, 0.18) + (0.15 if ch == " " else 0))
+
+
+def _safe_name(name):
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip().strip(".")
+    return name or "video"
+
+
+# --------------------------------------------------------------------------- main
+STEALTH_JS = """
+(() => {
+  try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
+})();
+"""
+
+
+class BlockedError(Exception):
+    pass
+
+
+def _check_blocked(page):
+    u = page.url
+    if "home-error" in u or "/418" in u or "static-pages" in u:
+        raise BlockedError(f"blocked by site: {u}")
+
+
+def _wait_results(page, timeout_s=60):
+    """Poll for the first result; fail fast if DuckDuckGo shows its block page."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        _check_blocked(page)
+        try:
+            if page.locator(SEL_FIRST_RESULT).first.is_visible():
+                return
+        except Exception:
+            pass  # navigation in progress
+        _sleep(0.5)
+    raise RuntimeError("results did not appear in time")
+
+
+def _scenario(page, url, city):
+    # 1. open the page
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    _check_blocked(page)
+    page.wait_for_selector(SEL_SEARCH_BOX, timeout=30000)
+    # 2. show the cursor (move once so it is drawn at its start point)
+    page.mouse.move(_mouse[0], _mouse[1])
+    _sleep(1.0)
+
+    ShowCallout(f"Searching for Magento developers in {city}", fade=1.0, hold=1.5)
+
+    # 3. glide to the search box and click it
+    bx, by = _target_point(page, SEL_SEARCH_BOX, 30000)
+    _move_mouse(page, bx, by)
+    _sleep(0.25)
+    page.mouse.click(bx, by)
+    if ZOOM_DEMO:
+        ZoomAt(bx, by)                          # zoom IN around the search box
+        _sleep(ZOOM_RAMP_SEC + 0.5)
+    _sleep(0.4)
+    # 4. type the query human-like
+    _type_human(page, f"Magento developer in {city}")
+    _sleep(0.6)
+    if ZOOM_DEMO:
+        ZoomAt(bx, by)                          # zoom OUT
+        _sleep(ZOOM_RAMP_SEC + 0.3)
+
+    # 5. click the search button (full navigation follows)
+    _move_and_click(page, SEL_SEARCH_BTN, timeout_ms=10000)
+
+    # 6. wait for results (client-side rendered, may be slow)
+    _wait_results(page)
+    _sleep(1.0)
+    page.mouse.move(_mouse[0], _mouse[1])  # make sure overlay is in place
+    ShowCallout("First result", fade=0.8, hold=1.0, x=420, y=140)
+
+    # 7. glide to the first result, zoom in on it, then click it
+    rx, ry = _target_point(page, SEL_FIRST_RESULT, 30000)
+    _move_mouse(page, rx, ry)
+    if ZOOM_DEMO:
+        ZoomAt(rx, ry)                          # zoom IN around the first result
+        _sleep(ZOOM_RAMP_SEC + 1.0)
+    _sleep(0.25)
+    page.mouse.click(rx, ry)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+    _sleep(1.5)
+    if ZOOM_DEMO:
+        ZoomAt()                                # zoom OUT on the page that opened
+        _sleep(ZOOM_RAMP_SEC + 1.5)
+    else:
+        _sleep(1.5)
+
+
+def _attempt(p, url, city, language, folder):
+    """One full recording attempt. Returns (ok, video_path, zoom_events, sync_t)."""
+    global _page
+    _mouse[0], _mouse[1] = 20.0, 20.0
+    _zoom["state"], _zoom["events"], _zoom["sync_t"] = "out", [], None
+    launch_kwargs = dict(
+        headless=HEADLESS,
+        args=["--disable-blink-features=AutomationControlled"],
+        ignore_default_args=["--enable-automation"],
+    )
+    if HEADLESS:
+        launch_kwargs["channel"] = "chromium"  # new headless, closer to real Chrome
+    browser = p.chromium.launch(**launch_kwargs)
+    context = browser.new_context(
+        viewport=VIEWPORT,
+        record_video_dir=folder,
+        record_video_size=VIEWPORT,
+        locale=language or "en",
+        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    f"(KHTML, like Gecko) Chrome/{browser.version} Safari/537.36"),
+    )
+    context.add_init_script(STEALTH_JS)
+    if not ZOOM_INDICATOR:
+        context.add_init_script("window.__zoomIndicator = false;")
+    context.add_init_script(OVERLAY_JS)
+    context.expose_function("__pwZoomEvent", _on_zoom_event)  # page -> python, survives navigations
+    context.expose_function("__pwSyncMarker", _on_sync_marker)
+    _zoom["t0"] = time.time()   # t = 0: Playwright starts the video when the page is created
+    page = context.new_page()
+    _page = page
+
+    def _sync_pointer(_page_arg=None):
+        # after a (cross-origin) navigation the page does not know where the pointer is
+        try:
+            page.evaluate("([x, y]) => window.__pwSetPos && window.__pwSetPos(x, y)",
+                          [_mouse[0], _mouse[1]])
+        except Exception:
+            pass
+
+    page.on("domcontentloaded", _sync_pointer)
+    ok, video_path = False, None
+    events = []
+    try:
+        _scenario(page, url, city)
+        ok = True
+    except Exception as exc:
+        print(f"qscript error: {exc!r}")
+    finally:
+        _page = None
+        try:
+            video_path = page.video.path() if page.video else None
+        except Exception:
+            video_path = None
+        events = list(_zoom["events"])
+        sync_t = _zoom["sync_t"]
+        context.close()  # finalizes the video file
+        browser.close()
+    return ok, video_path, events, sync_t
+
+
+def CaptureVideo_Magento(url, company_name, language, country,
+                         postcode, city, street, house_no):
+    """Record the scenario; return absolute path to the .webm or None on failure."""
+    folder = os.path.abspath(PATH_TO_VIDEO_FOLDER)
+    os.makedirs(folder, exist_ok=True)
+    final_path = os.path.join(folder, _safe_name(company_name) + ".webm")
+
+    with sync_playwright() as p:
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            ok, video_path, events, sync_t = _attempt(p, url, city, language, folder)
+            if ok and video_path and os.path.exists(video_path):
+                try:
+                    if os.path.exists(final_path):
+                        os.remove(final_path)
+                    shutil.move(video_path, final_path)
+                    sidecar = _write_zoom_sidecar(final_path, events, sync_t)
+                except Exception as exc:
+                    print(f"rename error: {exc!r}")
+                    return None
+                if sidecar:
+                    print(f"zoom events: {len(events)} -> {sidecar}", flush=True)
+                return final_path
+            # failed attempt: drop its video and retry with a fresh browser
+            if video_path and os.path.exists(video_path):
+                try:
+                    os.remove(video_path)
+                except OSError:
+                    pass
+            if attempt < MAX_ATTEMPTS:
+                print(f"retry {attempt + 1}/{MAX_ATTEMPTS} in 8 s ...", flush=True)
+                time.sleep(8)
+    return None

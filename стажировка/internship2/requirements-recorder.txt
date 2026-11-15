@@ -1,0 +1,3 @@
+# for the recorder on the host (capture_video.py / qscript.py / video_client.py)
+playwright>=1.40
+requests>=2.28
