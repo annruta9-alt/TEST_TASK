@@ -1,0 +1,12 @@
+.env
+.env.*
+.git
+uploads
+tests
+__pycache__
+*.pyc
+.pytest_cache
+*.md
+companies.csv
+requirements-dev.txt
+docker-compose.yml

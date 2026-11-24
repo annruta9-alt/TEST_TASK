@@ -1,0 +1,62 @@
+# DEEPSEEK_API_KEY comes from the shell or from a ".env" file next to this file
+# (never commit it; .env is in .gitignore and .dockerignore).
+x-app-env: &app_env
+  DB_HOST: db
+  DB_PORT: 5432
+  DB_NAME: videos
+  DB_USER: video_user
+  DB_PASSWORD: ${DB_PASSWORD:-video_pass}
+  DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+  DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+
+services:
+  web:
+    build: .                      # Apache + mod_wsgi + Flask (see Dockerfile)
+    image: company-impressum-service
+    ports:
+      - "8000:80"                 # host 8000 -> Apache 80 inside the container
+    volumes:
+      - uploads:/app/uploads
+    environment: *app_env
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # One-off enrichment run (not started by `docker compose up`):
+  #   docker compose run --rm enrich --dry-run
+  #   docker compose run --rm enrich --limit 1
+  enrich:
+    build: .
+    image: company-impressum-service
+    profiles: ["tools"]
+    entrypoint: ["/opt/venv/bin/python", "/app/enrich_companies.py"]
+    environment: *app_env
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: videos
+      POSTGRES_USER: video_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-video_pass}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U video_user -d videos"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # To run the database tests / enrich_companies.py on the host, publish the port:
+    # ports:
+    #   - "127.0.0.1:55432:5432"
+
+volumes:
+  db_data:
+  uploads:

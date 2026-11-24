@@ -1,0 +1,3 @@
+# to run the tests on the host (the stack itself needs only requirements.txt)
+-r requirements.txt
+pytest>=7
